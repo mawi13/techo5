@@ -28,6 +28,20 @@ const (
 	cameraShow = 30 * time.Second
 )
 
+// cameraRetry is how long a camera waits after a frame fails before asking again. A variable only so
+// that a test does not have to wait it out when it takes a view down.
+var cameraRetry = 2 * time.Second
+
+// spawn runs fn in the background and counts it, so that a test can wait for every goroutine a view
+// started to be gone (Feature.loops) before the next test swaps the config and Home Assistant under it.
+func (f *Feature) spawn(fn func()) {
+	f.loops.Add(1)
+	go func() {
+		defer f.loops.Done()
+		fn()
+	}()
+}
+
 // CameraView is what the screen shows.
 type CameraView struct {
 	Entity string
@@ -35,9 +49,16 @@ type CameraView struct {
 	Until  time.Time
 	Frame  *image.RGBA // the latest frame, scaled to fit; nil until the first arrives
 	Error  string      // why there is no frame, when there is none
+	// Caption is a notification's words over the view (feature/notify); nil for a plain camera.
+	Caption *Caption
+	// View numbers the view, so that a tap can close the view it was read from and not whichever is up
+	// when it gets around to it (HideView). Until cannot say which view it is: it moves when the first
+	// frame arrives. A camera asked for again while its view is up keeps its number, and a different
+	// notification's picture over it gets a new one.
+	View uint64
 
 	span time.Duration // how long it was asked for; Until is restarted from the first frame
-	gen  uint64        // which view this is: frames fetched for an earlier one are not shown in it
+	gen  uint64        // which fetch fills it: frames fetched for an earlier one are not shown in it
 }
 
 // LocalCamera is the entity name of the device's own camera on the list; it is not a Home
@@ -71,7 +92,7 @@ func (f *Feature) homeAssistantCameras() []config.Camera {
 	defer f.mu.Unlock()
 	if time.Since(f.haCamerasAt) > haCamerasEvery && !f.haCamerasBusy {
 		f.haCamerasBusy = true
-		go func() {
+		f.spawn(func() {
 			list, err := hass.Get().Entities("camera")
 			var cams []config.Camera
 			for _, e := range list {
@@ -93,7 +114,7 @@ func (f *Feature) homeAssistantCameras() []config.Camera {
 			if err == nil {
 				f.Changed.Emit(struct{}{})
 			}
-		}()
+		})
 	}
 	return f.haCameras
 }
@@ -116,24 +137,38 @@ func (f *Feature) ShowCamera(entity string, d time.Duration) {
 // showCamera is ShowCamera with the sound decided by the caller, which is what the action does: an
 // automation for a doorbell wants that one camera heard whether or not the device's setting says so.
 func (f *Feature) showCamera(entity string, d time.Duration, sound bool) {
-	name := entity
-	for _, c := range f.Cameras() {
-		if c.Entity == entity {
-			name = c.Name
+	f.showCameraCaptioned(entity, d, sound, nil)
+}
+
+// showCameraCaptioned puts a camera up with a notification's words over it, or none (nil): a camera
+// asked for any other way is a plain camera, so a caption never outlasts its notification.
+func (f *Feature) showCameraCaptioned(entity string, d time.Duration, sound bool, c *Caption) {
+	name, listed := entity, false
+	for _, cam := range f.Cameras() {
+		if cam.Entity == entity {
+			name, listed = cam.Name, true
 		}
 	}
 	f.mu.Lock()
 	fresh := f.cam.Entity != entity || time.Now().After(f.cam.Until)
-	f.cam = CameraView{Entity: entity, Name: name, Until: time.Now().Add(d), Frame: f.cam.Frame, span: d, gen: f.cam.gen}
+	if !listed && !fresh {
+		name = f.cam.Name // the same camera asked for again keeps the name it was given, looked up or not
+	}
+	view := f.cam.View
+	if fresh || !sameCaption(f.cam.Caption, c) {
+		// Asked for again with the same words (or none) it is the same thing on screen and keeps its
+		// number, so a tap read before the re-show still closes it; anything else is a new view.
+		view = f.newView()
+	}
+	f.cancelStill() // a camera in place of a still: the still's picture is not wanted
+	f.cam = CameraView{Entity: entity, Name: name, Until: time.Now().Add(d), Frame: f.cam.Frame, Caption: c, span: d, View: view, gen: f.cam.gen}
 	var ctx context.Context
 	if fresh {
 		f.cam.Frame = nil
 		f.camMuted = false // a fresh view starts audible if its sound was asked for
-		// A view of its own, ending what fetched for the one before: a camera closed while its stream
-		// was starting and opened again must not end up with two decoders.
-		if f.camCancel != nil {
-			f.camCancel()
-		}
+		// A fetch of its own, ending the one before: a camera closed while its stream was starting
+		// and opened again must not end up with two decoders.
+		f.cancelFetch()
 		f.camGen++
 		f.cam.gen = f.camGen
 		ctx, f.camCancel = context.WithCancel(context.Background())
@@ -143,17 +178,46 @@ func (f *Feature) showCamera(entity string, d time.Duration, sound bool) {
 	slog.Info("camera up", "entity", entity, "for", d, "sound", fresh && sound)
 	if fresh {
 		if entity == LocalCamera {
-			go f.localFrames()
+			f.spawn(func() { f.localFrames() })
 		} else {
-			go f.fetchFrames(ctx, entity, gen)
+			f.spawn(func() { f.fetchFrames(ctx, entity, gen) })
 		}
 		if sound && !isReolink(entity) {
 			// The sound is asked of Home Assistant and taken off the speaker when this view ends; a
 			// view already up keeps the sound it was started with (camera_sound.go).
-			go f.startCameraSound(entity, thisDevice())
+			f.spawn(func() { f.startCameraSound(entity, thisDevice()) })
 		}
 	}
+	if !listed && name == entity && entity != LocalCamera && !isReolink(entity) {
+		// Not on the device's list, or on Home Assistant's list before it has been fetched: Home
+		// Assistant is asked for this one camera's name rather than showing its entity id.
+		f.spawn(func() { f.lookUpName(entity, entity) })
+	}
 	f.Changed.Emit(struct{}{})
+}
+
+// lookUpName asks Home Assistant what it calls entity and puts that on the view in place of
+// placeholder, if the view is still entity's and still says placeholder. Nothing changes when Home
+// Assistant cannot be asked or has no name for it.
+func (f *Feature) lookUpName(entity, placeholder string) {
+	s, err := hass.Get().State(entity)
+	if err != nil {
+		slog.Debug("camera name", "entity", entity, "err", err)
+		return
+	}
+	name, _ := s.Attributes["friendly_name"].(string)
+	if name = strings.TrimSpace(name); name == "" {
+		return
+	}
+	f.mu.Lock()
+	ours := f.cam.Entity == entity && f.cam.Name == placeholder
+	if ours {
+		f.cam.Name = name
+	}
+	f.mu.Unlock()
+	if ours {
+		f.Changed.Emit(struct{}{})
+	}
 }
 
 // HoldCamera keeps the view of entity up for at least d more, if it is the one up: a camera being
@@ -170,16 +234,85 @@ func (f *Feature) HoldCamera(entity string, d time.Duration) {
 	}
 }
 
-// HideCamera takes the view down.
-func (f *Feature) HideCamera() {
+// newView is the number for a view being put up. The caller holds f.mu.
+func (f *Feature) newView() uint64 {
+	f.viewSeq++
+	return f.viewSeq
+}
+
+// sameCaption is whether two captions are the same notification's (or both none).
+func sameCaption(a, b *Caption) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.ID == b.ID
+}
+
+// HideView takes the view down if it is still the view numbered view, and says whether it did. The
+// compare and the hide are one step under the lock, so a tap that was read before a newer view replaced
+// its own cannot take the newer one down.
+func (f *Feature) HideView(view uint64) bool {
 	f.mu.Lock()
-	f.cam.Until = time.Time{}
-	if f.camCancel != nil {
-		f.camCancel() // what it fetched with stops now, not at its next look at the clock
-		f.camCancel = nil
+	ours := f.cam.View == view && f.cam.Entity != "" && time.Now().Before(f.cam.Until)
+	if ours {
+		f.cancelStill()
+		f.cancelFetch()
+		f.cam.Until = time.Time{}
+		f.cam.Caption = nil
 	}
 	f.mu.Unlock()
+	if ours {
+		f.Changed.Emit(struct{}{})
+	}
+	return ours
+}
+
+// HideCamera takes the view down, and forgets whose words were on it: a frame still on its way for
+// the view must find nothing to land on (viewIsUp), and a tap on a view gone must not be taken for a
+// tap on a notification that came after it.
+func (f *Feature) HideCamera() {
+	f.mu.Lock()
+	f.cancelStill()
+	f.cancelFetch()
+	f.cam.Until = time.Time{}
+	f.cam.Caption = nil
+	f.mu.Unlock()
 	f.Changed.Emit(struct{}{})
+}
+
+// HidePicture takes the view down if it is notification id's, and says whether it did. The compare and
+// the hide are one step under the lock, so a tap or a replacement landing while a newer notification
+// takes the page cannot take the newer one's view down.
+func (f *Feature) HidePicture(id string) bool {
+	f.mu.Lock()
+	ours := f.cam.Caption != nil && f.cam.Caption.ID == id && time.Now().Before(f.cam.Until)
+	if ours {
+		f.cancelStill()
+		f.cancelFetch()
+		f.cam.Until = time.Time{}
+		f.cam.Caption = nil
+	}
+	f.mu.Unlock()
+	if ours {
+		f.Changed.Emit(struct{}{})
+	}
+	return ours
+}
+
+// viewIsUp is whether entity's view is the one on the screen and has not run out or been taken down.
+// A fetch writes to the view only while this holds, with f.mu held across the check and the write:
+// otherwise a frame that was on its way when somebody tapped would put the view back up.
+func (f *Feature) viewIsUp(entity string) bool {
+	return f.cam.Entity == entity && time.Now().Before(f.cam.Until)
+}
+
+// cancelFetch ends what fetches for the camera view up, if anything does: its view is being replaced or
+// taken down. The caller holds f.mu.
+func (f *Feature) cancelFetch() {
+	if f.camCancel != nil {
+		f.camCancel()
+		f.camCancel = nil
+	}
 }
 
 // fetchFrames shows the camera while its view, gen, is up: its live stream where it has one and live
@@ -193,25 +326,27 @@ func (f *Feature) fetchFrames(ctx context.Context, entity string, gen uint64) {
 		f.showFrame(entity, gen, frame, err)
 		if err != nil {
 			slog.Warn("camera frame", "entity", entity, "err", err)
-			pause(ctx, 2*time.Second)
+			pause(ctx, cameraRetry)
 		}
 	}
 }
 
-// viewUp is whether view gen of entity is still on screen.
+// viewUp is whether the view gen of entity is still on screen and its fetch not called off.
 func (f *Feature) viewUp(ctx context.Context, entity string, gen uint64) bool {
 	if ctx.Err() != nil {
 		return false
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.cam.Entity == entity && f.cam.gen == gen && time.Now().Before(f.cam.Until)
+	return f.viewIsUp(entity) && f.cam.gen == gen
 }
 
 // showFrame puts a frame of entity's on screen, or why there is none, if its view gen is the one up.
+// The check and the write are one step under f.mu, so a frame on its way when somebody tapped does not
+// put the view back up.
 func (f *Feature) showFrame(entity string, gen uint64, frame *image.RGBA, err error) {
 	f.mu.Lock()
-	if f.cam.Entity == entity && f.cam.gen == gen {
+	if f.viewIsUp(entity) && f.cam.gen == gen {
 		if err != nil {
 			f.cam.Error = err.Error()
 		} else {
@@ -236,7 +371,9 @@ func (f *Feature) localFrames() {
 	release, err := camera.Get().Acquire()
 	if err != nil {
 		f.mu.Lock()
-		f.cam.Error = err.Error()
+		if f.viewIsUp(LocalCamera) {
+			f.cam.Error = err.Error()
+		}
 		f.mu.Unlock()
 		f.Changed.Emit(struct{}{})
 		return
@@ -253,7 +390,7 @@ func (f *Feature) localFrames() {
 	defer cancel()
 	for {
 		f.mu.Lock()
-		up := f.cam.Entity == LocalCamera && time.Now().Before(f.cam.Until)
+		up := f.viewIsUp(LocalCamera)
 		f.mu.Unlock()
 		if !up {
 			return
@@ -265,7 +402,7 @@ func (f *Feature) localFrames() {
 			shown := image.NewRGBA(dst.Bounds())
 			copy(shown.Pix, dst.Pix)
 			f.mu.Lock()
-			if f.cam.Entity == LocalCamera {
+			if f.viewIsUp(LocalCamera) {
 				if f.cam.Frame == nil {
 					if until := time.Now().Add(f.cam.span); until.After(f.cam.Until) {
 						f.cam.Until = until // never shorter than a hold asked for (HoldCamera)
@@ -281,9 +418,9 @@ func (f *Feature) localFrames() {
 	}
 }
 
-// Prewarm asks Home Assistant for one frame from every camera and drops it, and for the stream of
-// every camera it can stream. Some cameras take seconds to start a stream on the first request;
-// asking while the list is on screen means the one that gets tapped answers at once.
+// Prewarm asks Home Assistant for one frame from every camera and drops it. Some cameras take
+// seconds to start a stream on the first request; asking while the list is on screen means the
+// one that gets tapped answers at once.
 func (f *Feature) Prewarm() {
 	for _, c := range f.Cameras() {
 		if c.Entity == LocalCamera || isReolink(c.Entity) {
@@ -313,6 +450,11 @@ func (f *Feature) snapshot(entity string) (*image.RGBA, error) {
 	if err != nil {
 		return nil, err
 	}
+	return fitFrame(src), nil
+}
+
+// fitFrame scales a picture to fit the panel, keeping its shape.
+func fitFrame(src image.Image) *image.RGBA {
 	sw, sh := src.Bounds().Dx(), src.Bounds().Dy()
 	w, h := cameraFrameW, sh*cameraFrameW/sw
 	if h > cameraFrameH {
@@ -320,7 +462,7 @@ func (f *Feature) snapshot(entity string) (*image.RGBA, error) {
 	}
 	dst := image.NewRGBA(image.Rect(0, 0, w, h))
 	xdraw.ApproxBiLinear.Scale(dst, dst.Bounds(), src, src.Bounds(), xdraw.Src, nil)
-	return dst, nil
+	return dst
 }
 
 // MatchCamera finds a camera named in what was heard: "show the front door", "show me the deck
@@ -384,7 +526,7 @@ func (f *Feature) cameraActions() []*esphome.Action {
 			Name: "home_show_camera_sound",
 			Args: []esphome.Arg{{Name: "entity", Type: esphome.ArgString}, {Name: "seconds", Type: esphome.ArgInt}, {Name: "sound", Type: esphome.ArgString}},
 			Run: func(c esphome.Call) (any, error) {
-				f.showCamera(strings.TrimSpace(c.String("entity")), cameraSeconds(c), soundAsked(c.String("sound"), CameraSound()))
+				f.showCamera(strings.TrimSpace(c.String("entity")), cameraSeconds(c), ParseOnOff(c.String("sound"), CameraSound()))
 				return nil, nil
 			},
 		},
